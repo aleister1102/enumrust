@@ -2,10 +2,9 @@
 
 ![image](https://github.com/user-attachments/assets/0ff77e11-79d7-4232-abb6-785a6815221c)
 
-
 A comprehensive Rust-based tool to:
 
-* 🕵️‍♂️ **Enumerate subdomains** with **haktrails**
+* 🕵️‍♂️ **Enumerate subdomains** with **subfinder**
 * 🔐 **Augment with TLS certificate SANs** via **tlsx**
 * 🌐 **Resolve to IPs** using **dnsx**
 * ⚡ **Perform fast port scanning** with **masscan** and validate via **httpx**
@@ -20,17 +19,17 @@ A comprehensive Rust-based tool to:
 
 ## 🎯 Features
 
-1. 🚀 **Subdomain Enumeration**: `haktrails` + `anew` for deduplication
-2. 🧾 **Certificate SAN Extraction**: `tlsx -json -silent` + `jq`
-3. 🌐 **DNS Resolution**: `dnsx -a -resp-only -silent`
-4. 🔎 **Port Scanning**: `masscan` (1–65535, 10kpps)
-5. 🔍 **Port Validation**: `httpx -silent`
+1. 🚀 **Subdomain Enumeration**: `subfinder` + `anew` for deduplication  
+2. 🧾 **Certificate SAN Extraction**: `tlsx -json -silent` + `jq`  
+3. 🌐 **DNS Resolution**: `dnsx -a -resp-only -silent`  
+4. 🔎 **Port Scanning**: `masscan` (1–65535, 10kpps)  
+5. 🔍 **Port Validation**: `httpx -silent`  
 6. 🕸️ **Web Crawling**:
 
-   * 🔍 Extract S3 buckets via regex
-   * 🔗 Grab `<a>` links & HTML comments
-   * 🔒 Find hidden form inputs
-   * 🏹 Use `hakrawler` for parameter enumeration
+   * 🔍 Extract S3 buckets via regex  
+   * 🔗 Grab `<a>` links & HTML comments  
+   * 🔒 Find hidden form inputs  
+   * 🏹 Use `hakrawler` for parameter enumeration  
 
 ---
 
@@ -38,7 +37,7 @@ A comprehensive Rust-based tool to:
 
 Ensure the following tools are in your `$PATH`:
 
-> Rust, haktrails, tlsx, jq, dnsx, masscan, httpx, hakrawler
+> Rust, subfinder, tlsx, jq, dnsx, masscan, httpx, hakrawler
 
 ### 🔧 Rust and Dependencies
 
