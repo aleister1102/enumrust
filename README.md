@@ -61,8 +61,6 @@ Below are commands to install dependencies on macOS 🍎 (Homebrew) and Debian/U
 # 🛠️ haktrails (ProjectDiscovery)
 # macOS 🍎
 brew install projectdiscovery/tap/haktrails
-# Debian/Ubuntu 🐧
-sudo apt-get update && sudo apt-get install -y haktrails
 
 # 🔒 tlsx (ProjectDiscovery)
 go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest
@@ -73,8 +71,9 @@ brew install jq
 # Debian/Ubuntu 🐧
 sudo apt-get install -y jq
 
-# 🌐 dnsx (ProjectDiscovery)
+# 🌐 dnsx & subfinder (ProjectDiscovery)
 go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+go install github.com/projectdiscovery/subfinder
 
 # ⚡ masscan (fast port scanner)
 # macOS 🍎
