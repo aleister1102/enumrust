@@ -24,13 +24,13 @@ fn main() -> anyhow::Result<()> {
     fs::create_dir_all(domain)?;
     let base = Path::new(domain);
 
-    // 3: enumerate subdomains via haktrails
+    // 3: enumerate subdomains via subfinder
     let subs_txt = base.join("subdomains.txt");
-    println!("[*] Enumerating subdomains via haktrails...");
+    println!("[*] Enumerating subdomains via subfinder...");
     Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "echo {} | haktrails subdomains | anew {}",
+            "subfinder -silent -all -d {} | anew {}",
             domain,
             subs_txt.display()
         ))
@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
             ips_txt.display()
         ))
         .status()?;
-
+    
     // 3.2: port scan with masscan on IPs
     let masscan_txt = base.join("masscan.txt");
     println!("[*] Scanning ports with masscan...");
@@ -105,10 +105,10 @@ fn main() -> anyhow::Result<()> {
     let mut hidden_file = File::create(base.join("hiddenparams.txt"))?;
 
     // Regex patterns
-    let re_s3 = Regex::new(r"[a-z0-9\-]+\.s3\.amazonaws\.com")?;
+    let re_s3 = Regex::new(r"[a-z0-9\-]+\\.s3\\.amazonaws\\.com")?;
     let re_comment_urls = Regex::new(r#"https?://[^"\s]+"#)?;
     let re_comments = Regex::new(r#"<!--([\s\S]*?)-->"#)?;
-    let re_hidden = Regex::new(r#"<input[^>]+name=('?"?)([^"'>\s]+)("?'?)"#)?;
+    let re_hidden = Regex::new(r#"<input[^>]+name=('?\"?)([^"'>\s]+)("?'?)"#)?;
 
     // HTTP client
     let client = Client::builder()
