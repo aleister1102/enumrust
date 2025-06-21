@@ -1,131 +1,188 @@
-# 🚀 Subdomain Enumerator and Simple Crawler
+# 👵️ enumRust - Automated Offensive Recon Framework
 
-![image](https://github.com/user-attachments/assets/0ff77e11-79d7-4232-abb6-785a6815221c)
 
-A comprehensive Rust-based tool to:
 
-* 🕵️‍♂️ **Enumerate subdomains** with **subfinder**
-* 🔐 **Augment with TLS certificate SANs** via **tlsx**
-* 🌐 **Resolve to IPs** using **dnsx**
-* ⚡ **Perform fast port scanning** with **masscan** and validate via **httpx**
-* 🕸️ **Crawl live hosts** to extract:
+> **"Recon like a pro. Hunt like a ghost."**
 
-  * 🪣 S3 bucket URLs
-  * 🔗 In-scope links (including HTML comments)
-  * 🔒 Hidden form parameters
-  * 🔍 Additional parameters via **hakrawler**
+<div align="center">
+  <img src="https://github.com/user-attachments/assets/eca9253f-ea3e-4a77-8ebc-fb56e961bedd" width="350" alt="Recon Tool Banner" />
+</div>
+---
+
+## 📖 Overview
+
+`enumRust` is an **automated offensive recon framework** written in Rust that performs comprehensive reconnaissance and vulnerability analysis on any target domain.
+It integrates top-tier tools like `subfinder`, `httpx`, `masscan`, `nuclei`, `ffuf`, and `feroxbuster` to uncover:
+
+* 🔍 Subdomains
+* 🌐 Open ports & services
+* 🧪 Vulnerabilities (XSS, RCE, SSRF, etc.)
+* 📂 Sensitive files & directories
+* ☑️ Exposed cloud buckets
+* 🧪 Hidden form parameters
+* 🛡️ Misconfigurations via `robots.txt` and more!
 
 ---
 
-## 🎯 Features
+## 🛠️ Features
 
-1. 🚀 **Subdomain Enumeration**: `subfinder` + `anew` for deduplication  
-2. 🧾 **Certificate SAN Extraction**: `tlsx -json -silent` + `jq`  
-3. 🌐 **DNS Resolution**: `dnsx -a -resp-only -silent`  
-4. 🔎 **Port Scanning**: `masscan` (1–65535, 10kpps)  
-5. 🔍 **Port Validation**: `httpx -silent`  
-6. 🕸️ **Web Crawling**:
-
-   * 🔍 Extract S3 buckets via regex  
-   * 🔗 Grab `<a>` links & HTML comments  
-   * 🔒 Find hidden form inputs  
-   * 🏹 Use `hakrawler` for parameter enumeration  
+| Module                     | Description                                                            |
+| -------------------------- | ---------------------------------------------------------------------- |
+| 🧐 Subdomain Enumeration   | Uses `subfinder` & `tlsx` to find valid subdomains                     |
+| 📡 Port Scanning           | Executes `masscan` for lightning-fast port discovery                   |
+| 🔍 Service Validation      | Resolves IPs & checks HTTP/HTTPS services using `httpx`                |
+| 🔸 Crawler + Analysis      | Extracts JS/HTML paths, comments, URLs, and cloud storage exposures    |
+| 🧪 Vulnerability Scan      | Executes `nuclei` with critical tags like XSS, RCE, SSRF               |
+| 🏗️ Directory Brute-Force  | Uses `feroxbuster` with intelligent timeouts and result parsing        |
+| ☑️ Cloud Bucket Finder     | Regex-based discovery for AWS, GCP, Azure buckets                      |
+| 🧕‍♀️ Hidden Param Grabber | Extracts hidden form parameters for parameter pollution attacks        |
+| 📂 VHost Brute-Force       | Uses `ffuf` to brute virtual hosts with custom `Host:` headers         |
+| 🛡️ robots.txt Extractor   | Parses disallowed paths and adds them to wordlists for further fuzzing |
 
 ---
 
-## 🛠️ Installation
+## 🛠️ Dependencies
 
-Ensure the following tools are in your `$PATH`:
+The following tools must be installed and available in your `$PATH`:
 
-> Rust, subfinder, tlsx, jq, dnsx, masscan, httpx, hakrawler
+```
+subfinder, anew, tlsx, jq, dnsx, masscan, httpx, hakrawler, nuclei, curl, feroxbuster, ffuf
+```
 
-### 🔧 Rust and Dependencies
+You can check dependencies by running:
 
 ```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+cargo run --release -- -d example.com
+```
 
-# Clone repository
-git clone https://github.com/KingOfBugbounty/enumrust.git
-cd enumrust
+---
 
-# Build binary
+## 📦 Installation
+
+```bash
+git clone https://github.com/youruser/enumRust.git
+cd enumRust
 cargo build --release
 ```
 
-### ⚙️ External Tools
+---
 
-Below are commands to install dependencies on macOS 🍎 (Homebrew) and Debian/Ubuntu 🐧:
+## ⚙️ Usage
 
 ```bash
-# 🛠️ haktrails (ProjectDiscovery)
-# macOS 🍎
-brew install projectdiscovery/tap/haktrails
+./enumRust -d example.com
+```
 
-# 🔒 tlsx (ProjectDiscovery)
-go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest
+This will:
 
-# 🛠️ jq (JSON processor)
-# macOS 🍎
-brew install jq
-# Debian/Ubuntu 🐧
-sudo apt-get install -y jq
+1. Create a directory named `example.com`
+2. Perform full recon and scan workflow
+3. Save all results inside this directory
 
-# 🌐 dnsx & subfinder (ProjectDiscovery)
-go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
-go install github.com/projectdiscovery/subfinder
+---
 
-# ⚡ masscan (fast port scanner)
-# macOS 🍎
-brew install masscan
-# Debian/Ubuntu 🐧
-sudo apt-get install -y masscan
+## 📂 Output Files
 
-# 🔍 httpx (ProjectDiscovery)
-go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+| File                 | Description                            |
+| -------------------- | -------------------------------------- |
+| `subdomains.txt`     | All discovered subdomains              |
+| `masscan.txt`        | Raw port scan results                  |
+| `ports.txt`          | HTTP/HTTPS services on open ports      |
+| `http200.txt`        | Alive and reachable HTTP URLs          |
+| `cloud_buckets.txt`  | Detected exposed cloud storage         |
+| `urls.txt`           | Discovered internal URLs               |
+| `hiddenparams.txt`   | URLs with injectable hidden parameters |
+| `params.txt`         | Crawled parameters from URLs           |
+| `ferox_results.json` | Raw output from Feroxbuster            |
+| `ferox_parsed.txt`   | Clean parsed output from Feroxbuster   |
+| `nuclei_results.txt` | All vulnerability results              |
+| `vhost_results.txt`  | Found vhosts via FFUF                  |
 
-# 🕵️ hakrawler (Hakluke)
-go install github.com/hakluke/hakrawler@latest
+---
+
+## 📖 Methodology
+
+### 1. Subdomain Enumeration
+
+```bash
+subfinder -d domain.com | anew subdomains.txt
+tlsx → Collect SANs → append
+```
+
+### 2. Port & Service Discovery
+
+```bash
+dnsx → IPs
+masscan → Open ports
+httpx → Validate services
+```
+
+### 3. Crawling & Bucket Analysis
+
+* `reqwest` + `scraper` for HTML/JS/Comment URLs
+* Regex search for:
+
+  * ☑️ S3 Buckets
+  * 🧱 GCP/Azure Storage
+  * 👁️ Hidden Params
+
+### 4. Brute Forcing
+
+* `feroxbuster` with depth control and image filtering
+* `ffuf` for virtual hosts via `Host: FUZZ.domain.com`
+
+### 5. Vulnerability Scanning
+
+* `nuclei` with:
+
+  * `-tags` xss,rce,ssrf,keycloak,actuator,misconfig
+  * `-severity` medium,high,critical
+
+---
+
+## 🧬 Example Workflow
+
+```bash
+./enumRust -d target.com
+
+# Outputs directory:
+# └── target.com/
+#     ├── subdomains.txt
+#     ├── ports.txt
+#     ├── cloud_buckets.txt
+#     ├── ferox_results.json
+#     ├── nuclei_results.txt
+#     └── ...
 ```
 
 ---
 
-## 🚀 Usage
+## 🔐 Ethics
 
-```bash
-./target/release/enumrust --domain example.com
-```
-
-This generates a folder `example.com` with:
-
-| File               | Description                                 |
-| ------------------ | ------------------------------------------- |
-| `subdomains.txt`   | Enumerated and SAN-derived subdomains       |
-| `ips.txt`          | Resolved A records                          |
-| `masscan.txt`      | Raw masscan output                          |
-| `ports.txt`        | Validated open HTTP(S) ports                |
-| `http200.txt`      | Alive hosts via httpx                       |
-| `s3.txt`           | Discovered S3 buckets                       |
-| `urls.txt`         | Extracted URLs                              |
-| `hiddenparams.txt` | Generated hidden-input test URLs            |
-| `params.txt`       | Additional parameterized URLs via hakrawler |
+> This tool is for educational and authorized penetration testing only.
+> Do **not** use against targets without proper authorization.
+> The developer assumes **no liability** for misuse.
 
 ---
 
-## 🙏 Acknowledgements
+## ❤️ Credits
 
-* [haktrails](https://github.com/hakluke/haktrails) by ProjectDiscovery
-* [tlsx](https://github.com/projectdiscovery/tlsx) by ProjectDiscovery
-* [dnsx](https://github.com/projectdiscovery/dnsx) by ProjectDiscovery
-* [masscan](https://github.com/robertdavidgraham/masscan) by Robert David Graham
-* [httpx](https://github.com/projectdiscovery/httpx) by ProjectDiscovery
-* [hakrawler](https://github.com/hakluke/hakrawler) by hakluke
-* [Clap](https://github.com/clap-rs/clap) for CLI parsing
-* [Reqwest](https://github.com/seanmonstar/reqwest)
-* [Scraper](https://github.com/causal-agent/scraper)
+* ProjectDiscovery (Subfinder, HTTPX, Nuclei)
+* Daniel Miessler (SecLists)
+* Feroxbuster by @epi052
+* FFUF by @ffuf
 
 ---
 
-## 📄 License
+## 🤋 Bug Reports / Suggestions
 
-MIT License. See [LICENSE](LICENSE) for details.
+Found a bug or want a new feature?
+
+📬 Open an issue or PR at:
+**[github.com/youruser/enumRust/issues](https://github.com/KingOfBugbounty/enumrust)**
+
+---
+
+## 🧠 "Let Recon Rule The Hunt"
+
+---
