@@ -179,7 +179,8 @@ httpx → Validate services
 Found a bug or want a new feature?
 
 📬 Open an issue or PR at:
-**[github.com/youruser/enumRust/issues](https://github.com/KingOfBugbounty/enumrust)**
+**[github.com/KingOfBugbounty/enumrust](https://github.com/KingOfBugbounty/enumrust)**
+
 
 ---
 
