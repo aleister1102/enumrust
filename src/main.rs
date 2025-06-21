@@ -1,213 +1,367 @@
+use std::{
+    collections::HashSet,
+    fs,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 use clap::Parser;
+use rusqlite::{params, Connection};
+use tokio::{
+    process::Command,
+    sync::{Mutex, Semaphore},
+    time::{interval, sleep},
+    fs::OpenOptions,
+    io::AsyncWriteExt,
+};
+use chrono::Local;
+use futures::stream::{FuturesUnordered, StreamExt};
+use anyhow::{anyhow, Context};
 use regex::Regex;
-use reqwest::blocking::Client;
-use scraper::{Html, Selector};
-use serde_json::Value;
-use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
-use colored::*;
 
-/// Subdomain enumerator and simple crawler with port scanning
 #[derive(Parser)]
-#[command(author, version, about)]
+#[command(about = "Ferramenta Avançada de Monitoramento para Bug Bounty")]
 struct Args {
-    /// Target domain to enumerate
-    #[arg(short, long)]
-    domain: String,
+    #[arg(short, long, help = "Ativa modo verboso")]
+    verbose: bool,
+
+    #[arg(short, long, help = "Domínio para monitorar", conflicts_with_all = &["import_list", "list_contains", "count", "mass_scan", "remove"])]
+    domain: Option<String>,
+
+    #[arg(
+        long = "import-list",
+        alias = "import_list",
+        value_name = "FILE",
+        help = "Importa subdomínios de um arquivo",
+        conflicts_with_all = &["domain", "list_contains", "count", "mass_scan", "remove"]
+    )]
+    import_list: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATTERN",
+        help = "Lista subdomínios que contenham o padrão",
+        conflicts_with_all = &["domain", "import_list", "count", "mass_scan", "remove"]
+    )]
+    list_contains: Option<String>,
+
+    #[arg(long, help = "Exibe quantidade total de subdomínios", conflicts_with_all = &["domain", "import_list", "list_contains", "mass_scan", "remove"])]
+    count: bool,
+
+    #[arg(
+        long = "mass-scan",
+        value_name = "FILE",
+        help = "Escaneia múltiplos domínios de um arquivo",
+        conflicts_with_all = &["domain", "import_list", "list_contains", "count", "remove"]
+    )]
+    mass_scan: Option<String>,
+
+    #[arg(
+        long = "remove",
+        value_name = "PATTERN",
+        help = "Remove subdomínios que contenham o padrão",
+        conflicts_with_all = &["domain", "import_list", "list_contains", "count", "mass_scan"]
+    )]
+    remove: Option<String>,
+
+    #[arg(
+        long = "output-dir",
+        value_name = "DIRECTORY",
+        help = "Diretório para salvar todos os resultados"
+    )]
+    output_dir: Option<String>,
 }
 
-fn validate_dependencies() {
-    let tools = vec![
-        "subfinder", "anew", "tlsx", "jq", "dnsx", "masscan", "httpx", "hakrawler",
-        "nuclei", "curl", "feroxbuster", "ffuf"
-    ];
+const DB_FILE: &str = "monrust.db";
+const SCAN_RESULTS_DIR: &str = "scan_results";
+const DEFAULT_SCAN_INTERVAL: u64 = 10;
+const API_WORDLIST_URL: &str = "https://gist.githubusercontent.com/helcaraxeals/7c45201b1c957ecea82ef7800da4bfa4/raw/b84a7364f33f2eb14aad68149302077649d70acc/api_wordlist.txt";
+const GENERAL_WORDLIST_URL: &str = "https://raw.githubusercontent.com/onvio/wordlists/master/words_and_files_top5000.txt";
+const DEFAULT_THREADS: usize = 50;
+const DEFAULT_SEVERITY: &str = "medium,high,critical";
+const TOP_1000_PORTS: &str = "80,81,300,443,591,593,832,981,1010,1311,2082,2087,2095,2096,2480,3000,3128,3333,4243,4567,4711,4712,4993,5000,5104,5108,5800,6543,7000,7396,7474,8000,8001,8008,8014,8042,8069,8080,8081,8088,8090,8091,8118,8123,8172,8222,8243,8280,8281,8333,8443,8500,8834,8880,8888,8983,9000,9043,9060,9080,9090,9091,9200,9443,9800,9981,12443,16080,18091,18092,20720,28017";
 
-    println!("\n🔍 Checking required tools:\n");
-    for tool in tools {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Aumentar limite de arquivos abertos
+    tokio::task::spawn_blocking(|| {
+        let _ = rlimit::increase_nofile_limit(100_000).unwrap();
+    }).await?;
+
+    let args = Args::parse();
+    
+    // Determinar diretório de saída
+    let output_dir = args.output_dir.as_deref().unwrap_or(SCAN_RESULTS_DIR);
+    
+    // Criar diretório para resultados
+    fs::create_dir_all(output_dir).context("Falha ao criar diretório de resultados")?;
+    
+    let scan_interval = if args.mass_scan.is_some() {
+        0
+    } else {
+        DEFAULT_SCAN_INTERVAL
+    };
+
+    if args.verbose {
+        println!("[⚙️ CONFIG] Severidade: {}", DEFAULT_SEVERITY);
+        println!("[⚙️ CONFIG] Threads: {}", DEFAULT_THREADS);
+        println!("[⚙️ CONFIG] Intervalo de scan: {} minutos", scan_interval);
+        println!("[⚙️ CONFIG] Diretório de resultados: {}", output_dir);
+    }
+
+    let conn = Arc::new(Mutex::new(init_db()?));
+
+    if let Err(e) = download_wordlist("api_wordlist.txt", API_WORDLIST_URL).await {
+        eprintln!("❌ Falha ao baixar API wordlist: {}", e);
+    }
+    if let Err(e) = download_wordlist("general_wordlist.txt", GENERAL_WORDLIST_URL).await {
+        eprintln!("❌ Falha ao baixar wordlist geral: {}", e);
+    }
+
+    if args.domain.is_none()
+        && args.import_list.is_none()
+        && args.list_contains.is_none()
+        && !args.count
+        && args.mass_scan.is_none()
+        && args.remove.is_none()
+    {
+        println!(
+            r#"
+🛠️ MonRust - Monitoramento de Subdomínios (Bug Bounty Edition)
+
+OPÇÕES:
+  -d, --domain <DOMÍNIO>         Monitora um domínio recursivamente
+  --import-list <ARQUIVO>        Importa subdomínios de um arquivo
+  --list_contains <PADRÃO>       Lista subdomínios que contenham o padrão
+  --count                        Exibe quantidade total de subdomínios
+  --mass-scan <ARQUIVO>          Escaneia múltiplos domínios de um arquivo
+  --remove <PADRÃO>              Remove subdomínios que contenham o padrão
+  --output-dir <DIRETÓRIO>       Diretório para salvar todos os resultados
+
+EXEMPLOS:
+  monRust -d example.com             # Monitora um único domínio
+  monRust --mass-scan dominios.txt   # Escaneia em massa
+  monRust --remove teste             # Remove subdomínios com 'teste'
+"#
+        );
+        return Ok(());
+    }
+
+    if let Some(pattern) = args.remove {
+        println!("🗑️ Removendo subdomínios que contêm: {}", pattern);
+        let conn = conn.lock().await;
+        let mut stmt = conn.prepare("DELETE FROM domains WHERE name LIKE '%' || ?1 || '%'")?;
+        let count = stmt.execute(params![pattern])?;
+        println!("✅ {} subdomínios removidos", count);
+        return Ok(());
+    }
+
+    if let Some(file) = args.import_list.clone() {
+        println!("📥 Importando subdomínios do arquivo: {}", file);
+        let contents = fs::read_to_string(&file)?;
+        let mut new_subs = HashSet::new();
+        let conn = conn.lock().await;
+        for line in contents.lines() {
+            let sub = line.trim();
+            if !sub.is_empty() {
+                match conn.execute(
+                    "INSERT OR IGNORE INTO domains (name, seen_at, processed) VALUES (?1, ?2, 0)",
+                    params![sub, Local::now().to_rfc3339()],
+                ) {
+                    Ok(1) => println!("✅ Subdomínio adicionado ao banco: {}", sub),
+                    Ok(0) => println!("ℹ️ Subdomínio já existente: {}", sub),
+                    Ok(_) => (),
+                    Err(e) => eprintln!("❌ Erro ao inserir subdomínio '{}': {}", sub, e),
+                }
+                new_subs.insert(sub.to_string());
+            }
+        }
+        println!("✅ {} subdomínios importados com sucesso!", new_subs.len());
+        return Ok(());
+    }
+
+    if let Some(pat) = args.list_contains {
+        println!("🔎 Buscando subdomínios com padrão: {}", pat);
+        let conn = conn.lock().await;
+        let mut stmt = conn.prepare("SELECT name FROM domains WHERE name LIKE '%' || ?1 || '%' ORDER BY name")?;
+        let rows = stmt.query_map(params![pat], |r| r.get::<_, String>(0))?;
+        for res in rows { println!("{}", res?); }
+        return Ok(());
+    }
+
+    if args.count {
+        let conn = conn.lock().await;
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM domains", [], |r| r.get(0))?;
+        println!("📊 Total de subdomínios: {}", total);
+        return Ok(());
+    }
+
+    if let Some(mass_scan_file) = args.mass_scan {
+        if std::env::var("TMUX").is_err() {
+            let session_name = "monrust_mass_scan";
+            let exe_path = std::env::current_exe()?;
+
+            // Comando corrigido: loop infinito para manter o tmux aberto
+            let cmd = format!(
+                "tmux new-session -d -s {} 'while true; do {} --mass-scan {}; sleep 600; done'",
+                session_name,
+                exe_path.display(),
+                mass_scan_file
+            );
+
+            let status = Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .status()
+                .await?;
+
+            if status.success() {
+                println!("🆕 Sessão tmux '{}' criada com sucesso!", session_name);
+                println!("🔍 Use 'tmux attach -t {}' para acompanhar", session_name);
+                return Ok(());
+            } else {
+                eprintln!("⚠️ Falha ao criar sessão tmux. Continuando na sessão atual...");
+            }
+        }
+
+        println!("🚀 Iniciando escaneamento em massa de: {}", mass_scan_file);
+        let contents = fs::read_to_string(&mass_scan_file)?;
+        let domains: Vec<String> = contents.lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if domains.is_empty() {
+            eprintln!("❌ Arquivo vazio ou sem domínios válidos");
+            return Ok(());
+        }
+
+        println!("🔍 {} domínios para escanear", domains.len());
+        
+        let mut tasks = FuturesUnordered::new();
+        let scan_sem = Arc::new(Semaphore::new(DEFAULT_THREADS));
+        let task_semaphore = Arc::new(Semaphore::new(5)); // Máximo de 5 tarefas simultâneas
+
+        for domain in domains {
+            let conn = Arc::clone(&conn);
+            let scan_sem = scan_sem.clone();
+            let task_semaphore = task_semaphore.clone();
+            let output_dir = output_dir.to_string();
+            
+            tasks.push(tokio::spawn(async move {
+                let _permit = task_semaphore.acquire().await;
+                let _permit2 = scan_sem.acquire().await;
+                monitor_domain_internal(&domain, conn, DEFAULT_THREADS, 0, &output_dir).await
+            }));
+        }
+
+        while let Some(result) = tasks.next().await {
+            if let Err(e) = result {
+                eprintln!("❌ Erro na task: {}", e);
+            }
+        }
+
+        return Ok(());
+    }
+
+    if let Some(domain) = args.domain {
+        let threads = std::cmp::min(DEFAULT_THREADS, 20);
+        monitor_domain(&domain, conn, threads, scan_interval, output_dir).await?;
+    }
+
+    Ok(())
+}
+
+async fn download_wordlist(filename: &str, url: &str) -> anyhow::Result<()> {
+    if !Path::new(filename).exists() {
+        println!("⬇️ Baixando wordlist: {}", filename);
+        let status = Command::new("curl")
+            .arg("-s")
+            .arg("-o")
+            .arg(filename)
+            .arg(url)
+            .status()
+            .await?;
+        
+        if !status.success() {
+            return Err(anyhow!("Falha ao baixar wordlist: {}", filename));
+        }
+        println!("✅ Wordlist baixada: {}", filename);
+        
+        let metadata = fs::metadata(filename)?;
+        if metadata.len() == 0 {
+            return Err(anyhow!("Arquivo wordlist vazio: {}", filename));
+        }
+    }
+    Ok(())
+}
+
+async fn monitor_domain(
+    domain: &str,
+    conn: Arc<Mutex<Connection>>,
+    threads: usize,
+    scan_interval: u64,
+    output_dir: &str,
+) -> anyhow::Result<()> {
+    if std::env::var("TMUX").is_err() {
+        let session_name = format!("monrust_{}", domain.replace('.', "_"));
+        let exe_path = std::env::current_exe()?;
+
+        // Comando corrigido: loop infinito para manter o tmux aberto
+        let cmd = format!(
+            "tmux new-session -d -s {} 'while true; do {} -d {}; sleep {}; done'",
+            session_name,
+            exe_path.display(),
+            domain,
+            scan_interval * 60
+        );
+
         let status = Command::new("sh")
             .arg("-c")
-            .arg(format!("command -v {} > /dev/null", tool))
+            .arg(&cmd)
             .status()
-            .expect("Failed to run shell");
+            .await?;
 
         if status.success() {
-            println!("✅ {} is installed", tool.green());
+            println!("🆕 Sessão tmux '{}' criada com sucesso!", session_name);
+            println!("🔍 Use 'tmux attach -t {}' para acompanhar", session_name);
+            return Ok(());
         } else {
-            println!("❌ {} is missing", tool.red());
+            eprintln!("⚠️ Falha ao criar sessão tmux. Continuando na sessão atual...");
         }
     }
-    println!("");
+
+    monitor_domain_internal(domain, conn, threads, scan_interval, output_dir).await
 }
 
-fn brute_force_vhosts(domain: &str, base: &Path) -> anyhow::Result<()> {
-    let vhost_output = base.join("vhost_results.txt");
-    
-    if vhost_output.exists() {
-        println!("[*] Vhost results already exist, skipping...");
+async fn monitor_domain_internal(
+    domain: &str,
+    conn: Arc<Mutex<Connection>>,
+    threads: usize,
+    scan_interval: u64,
+    output_dir: &str,
+) -> anyhow::Result<()> {
+    println!("🔄 Iniciando monitoramento para: {}", domain);
+
+    if scan_interval == 0 {
+        println!("🚀 Execução única para: {}", domain);
+        process_scan_cycle(&domain, &conn, threads, output_dir).await?;
         return Ok(());
     }
 
-    let vhost_wordlist_url = "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-110000.txt";
-    let vhost_wordlist_path = base.join("vhost_wordlist.txt");
-    
-    if !vhost_wordlist_path.exists() {
-        println!("[*] Downloading vhost wordlist...");
-        let _ = Command::new("sh")
-            .arg("-c")
-            .arg(format!("curl -s -o {} {}", vhost_wordlist_path.display(), vhost_wordlist_url))
-            .status()?;
+    let mut ticker = interval(Duration::from_secs(scan_interval * 60));
+
+    loop {
+        ticker.tick().await;
+        println!("⏳ Verificando novos subdomínios para {}...", domain);
+        process_scan_cycle(&domain, &conn, threads, output_dir).await?;
     }
-
-    println!("[*] Brute-forcing virtual hosts with ffuf...");
-    
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "ffuf -u http://{} -w {} -H \"Host: FUZZ.{}\" -mc all -fc 400-499 -o {} -of json -v",
-            domain,
-            vhost_wordlist_path.display(),
-            domain,
-            vhost_output.display()
-        ))
-        .status()?;
-
-    if !status.success() {
-        println!("{} Failed to run ffuf vhost scan", "✗".red());
-        return Ok(());
-    }
-
-    if vhost_output.exists() {
-        let contents = fs::read_to_string(&vhost_output)?;
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
-            if let Some(results) = json.get("results").and_then(|r| r.as_array()) {
-                let mut found = false;
-                for result in results {
-                    if let (Some(url), Some(host)) = (result.get("url"), result.get("host")) {
-                        let url_str = url.as_str().unwrap_or("");
-                        let host_str = host.as_str().unwrap_or("");
-                        if !host_str.is_empty() {
-                            println!("{} Found vhost: {} at {}", "✔".green(), host_str.green(), url_str);
-                            found = true;
-                        }
-                    }
-                }
-                if !found {
-                    println!("{} No vhosts found", "✗".yellow());
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
-fn parse_feroxbuster_results(ferox_output: &Path, base: &Path) -> anyhow::Result<()> {
-    let parsed_output = base.join("ferox_parsed.txt");
-    let mut output_file = File::create(&parsed_output)?;
-    
-    if ferox_output.exists() {
-        let contents = fs::read_to_string(ferox_output)?;
-        
-        // Feroxbuster 2.x+ outputs JSON lines format
-        for line in contents.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            
-            // Skip configuration lines that start with {
-            if line.trim().starts_with('{') && line.contains("Configuration") {
-                continue;
-            }
-            
-            // Try to parse as JSON only if it looks like a result line
-            if line.contains("url") && line.contains("status") {
-                match serde_json::from_str::<Value>(line) {
-                    Ok(json) => {
-                        if let (Some(url), Some(status), Some(word)) = (
-                            json.get("url").and_then(|u| u.as_str()),
-                            json.get("status").and_then(|s| s.as_u64()),
-                            json.get("word").and_then(|w| w.as_str())
-                        ) {
-                            // Skip image and non-content extensions
-                            let blacklist = [".png", ".ico", ".jpeg", ".jpg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".eot"];
-                            if !blacklist.iter().any(|ext| url.ends_with(ext)) {
-                                writeln!(output_file, "{} [{}] - Found via: {}", url, status, word)?;
-                            }
-                        }
-                    },
-                    Err(e) => eprintln!("{} Failed to parse line: {} - {}", "✗".red(), line, e),
-                }
-            } else {
-                // If not JSON, try to parse as simple output line
-                if line.contains("200") && line.contains("GET") {
-                    if let Some(url) = line.split_whitespace().nth(1) {
-                        writeln!(output_file, "{}", url)?;
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn run_nuclei_scan(http200_txt: &Path, base: &Path) -> anyhow::Result<()> {
-    let nuclei_output = base.join("nuclei_results.txt");
-    
-    println!("\n{} Running Nuclei scan on all discovered URLs", "⚡".yellow());
-    
-    let status = Command::new("nuclei")
-        .args(&[
-            "-l", http200_txt.to_str().unwrap(),
-            "-tags", "xss,rce,ssrf,keycloak,actuator,misconfig",
-            "-etags", "ssl,info",
-            "-follow-redirects",
-            "-severity", "medium,high,critical",
-            "-no-color",
-            "-silent",
-            "-o", nuclei_output.to_str().unwrap()
-        ])
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
-
-    if !status.success() {
-        println!("{} Nuclei scan completed with some errors", "⚠".yellow());
-    } else {
-        println!("{} Nuclei scan completed successfully", "✔".green());
-    }
-
-    Ok(())
-}
-
-fn extract_hidden_params(
-    base_url: &str,
-    html: &str,
-    re_hidden: &Regex,
-) -> Option<Vec<String>> {
-    let mut params = Vec::new();
-    for cap in re_hidden.captures_iter(html) {
-        let name = cap[2].to_string();
-        if name.contains("__") {
-            continue;
-        }
-        params.push(format!("{}=enumrust", name));
-    }
-    if params.is_empty() {
-        return None;
-    }
-    let sep = if base_url.contains('?') { "&" } else { "?" };
-    let full = format!("{}{}{}", base_url, sep, params.join("&"));
-    Some(vec![full])
-}
-
-// Função para buscar e analisar robots.txt
-fn fetch_robots_paths(domain: &str) -> anyhow::Result<Vec<String>> {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+// Função para extrair palavras do robots.txt
+async fn extract_words_from_robots(domain: &str) -> anyhow::Result<Vec<String>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
         .danger_accept_invalid_certs(true)
         .build()?;
 
@@ -217,10 +371,10 @@ fn fetch_robots_paths(domain: &str) -> anyhow::Result<Vec<String>> {
     ];
 
     for url in &robots_urls {
-        match client.get(url).send() {
+        match client.get(url).send().await {
             Ok(resp) if resp.status().is_success() => {
-                let content = resp.text()?;
-                println!("✅ {} Found robots.txt for {}", "✔".green(), domain);
+                let content = resp.text().await?;
+                println!("✅ Robots.txt encontrado para: {}", domain);
                 
                 // Extrair caminhos do robots.txt
                 let path_re = Regex::new(r"(?i)(?:Allow|Disallow):\s*(/\S*)")?;
@@ -228,346 +382,590 @@ fn fetch_robots_paths(domain: &str) -> anyhow::Result<Vec<String>> {
                 
                 for cap in path_re.captures_iter(&content) {
                     if let Some(path) = cap.get(1) {
-                        let path_str = path.as_str().to_string();
-                        println!("   🛣️ {}", path_str.blue());
-                        paths.push(path_str);
+                        paths.push(path.as_str().to_string());
                     }
                 }
                 
-                return Ok(paths);
+                // Extrair palavras dos caminhos
+                let word_re = Regex::new(r"[\w-]{3,}")?;
+                let mut words = HashSet::new();
+                
+                for path in paths {
+                    for cap in word_re.captures_iter(&path) {
+                        if let Some(word) = cap.get(0) {
+                            let word = word.as_str().to_lowercase();
+                            words.insert(word);
+                        }
+                    }
+                }
+                
+                if words.is_empty() {
+                    println!("ℹ️ Nenhuma palavra extraída do robots.txt");
+                    return Ok(Vec::new());
+                }
+                
+                println!("📝 {} palavras extraídas do robots.txt", words.len());
+                return Ok(words.into_iter().collect());
             }
             _ => continue,
         }
     }
     
-    println!("ℹ️ No robots.txt found for {}", domain);
+    println!("ℹ️ Robots.txt não encontrado para: {}", domain);
     Ok(Vec::new())
 }
 
 // Função para adicionar palavras às wordlists
-fn add_words_to_wordlists(paths: &[String], wordlist_path: &Path) -> anyhow::Result<()> {
-    if paths.is_empty() {
+async fn add_words_to_wordlists(words: &[String]) -> anyhow::Result<()> {
+    if words.is_empty() {
         return Ok(());
     }
 
-    let mut file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(wordlist_path)?;
+    for &wordlist in &["general_wordlist.txt", "api_wordlist.txt"] {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(wordlist)
+            .await?;
 
-    for path in paths {
-        // Extrair palavras dos caminhos
-        let word_re = Regex::new(r"[\w-]{3,}")?;
-        for cap in word_re.captures_iter(path) {
-            if let Some(word) = cap.get(0) {
-                let word = word.as_str().to_lowercase();
-                writeln!(file, "{}", word)?;
-                println!("   📝 Added to wordlist: {}", word.green());
-            }
+        for word in words {
+            file.write_all(word.as_bytes()).await?;
+            file.write_all(b"\n").await?;
         }
     }
 
-    println!("✅ Added {} paths to wordlist", paths.len());
+    println!("✅ Palavras adicionadas às wordlists");
     Ok(())
 }
 
-// Função para executar o feroxbuster com timeout de 1 minuto
-fn run_feroxbuster_with_timeout(
-    combined_targets: &Path,
-    wordlist_path: &Path,
-    ferox_output: &Path,
+async fn process_scan_cycle(
+    domain: &str,
+    conn: &Arc<Mutex<Connection>>,
+    threads: usize,
+    output_dir: &str,
 ) -> anyhow::Result<()> {
-    println!("[*] Running feroxbuster with 1-minute timeout...");
-    
-    let start_time = Instant::now();
-    let timeout_duration = Duration::from_secs(60); // 1 minuto
-    
-    let mut cmd = Command::new("feroxbuster")
-        .args(&[
-            "--stdin",
-            "--wordlist", wordlist_path.to_str().unwrap(),
-            "--threads", "100",
-            "--auto-tune",
-            "--dont-collect", "jpg,jpeg,png,gif,ico,bmp,svg,webp,tiff,woff,woff2,ttf,eot",
-            "--depth", "5",
-            "--insecure",
-            "--silent",
-            "--random-agent",
-            "--status-codes", "200",
-            "--collect-backups",
-            "--collect-extensions",
-            "--scan-limit", "10",
-            "--output", ferox_output.to_str().unwrap()
-        ])
-        .stdin(File::open(combined_targets)?)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    
-    // Verifica periodicamente se o tempo expirou
-    while start_time.elapsed() < timeout_duration {
-        match cmd.try_wait() {
-            Ok(Some(status)) => {
-                if status.success() {
-                    println!("{} Feroxbuster completed successfully", "✔".green());
-                } else {
-                    println!("{} Feroxbuster completed with errors", "⚠".yellow());
-                }
-                return Ok(());
+    println!("🌐 Enumerando subdomínios para: {}", domain);
+    let current_domains = match enum_subdomains(&domain).await {
+        Ok(subs) => {
+            if subs.is_empty() {
+                println!("ℹ️ Nenhum subdomínio encontrado para {}", domain);
+            } else {
+                println!("✅ {} subdomínios encontrados para {}", subs.len(), domain);
             }
-            Ok(None) => {
-                // Ainda está rodando, espera um pouco
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => {
-                eprintln!("Error waiting for feroxbuster: {}", e);
-                return Err(e.into());
+            subs
+        },
+        Err(e) => {
+            eprintln!("❌ Erro ao enumerar subdomínios: {}", e);
+            return Ok(());
+        }
+    };
+
+    let known = {
+        let conn = conn.lock().await;
+        get_known(&conn)?
+    };
+
+    let new: HashSet<_> = current_domains.difference(&known).cloned().collect();
+    
+    if new.is_empty() {
+        println!("⏭️ Nenhum novo subdomínio encontrado para {} em {}", domain, Local::now());
+        return Ok(());
+    }
+
+    println!("🎯 {} novos subdomínios encontrados para {}!", new.len(), domain);
+    
+    if new.len() > 10 {
+        let message = format!(
+            "🎯 *{} novos subdomínios* encontrados para {}!\n\nLista completa disponível no banco de dados.",
+            new.len(), domain
+        );
+        alert_telegram("Descoberta de Subdomínios", &message).await?;
+    } else {
+        let new_subs_list = new.iter().map(|s| format!("• {}", s)).collect::<Vec<_>>().join("\n");
+        let message = format!(
+            "🎯 *{} novos subdomínios* encontrados para {}!\n\n{}\n\n🔄 Iniciando escaneamento...",
+            new.len(), domain, new_subs_list
+        );
+        alert_telegram("Descoberta de Subdomínios", &message).await?;
+    }
+
+    {
+        let conn = conn.lock().await;
+        for sub in &new {
+            match conn.execute(
+                "INSERT OR IGNORE INTO domains (name, seen_at, processed) VALUES (?1, ?2, 0)",
+                params![sub, Local::now().to_rfc3339()],
+            ) {
+                Ok(1) => println!("✅ Subdomínio adicionado ao banco: {}", sub),
+                Ok(0) => println!("ℹ️ Subdomínio já existente: {}", sub),
+                Ok(_) => (),
+                Err(e) => eprintln!("❌ Erro ao inserir subdomínio '{}': {}", sub, e),
             }
         }
     }
+
+    let task_semaphore = Arc::new(Semaphore::new(5)); // Máximo de 5 tarefas simultâneas
+    let mut tasks: FuturesUnordered<tokio::task::JoinHandle<()>> = FuturesUnordered::new();
+
+    for new_domain in new {
+        let conn = Arc::clone(conn);
+        let task_semaphore = task_semaphore.clone();
+        let output_dir = output_dir.to_string();
+        
+        tasks.push(tokio::spawn(async move {
+            // Adquirir permissão do semáforo
+            let _permit = match task_semaphore.acquire().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+
+            println!("🔍 Iniciando escaneamento para: {}", new_domain);
+            
+            // Extrair palavras do robots.txt e adicionar às wordlists
+            match extract_words_from_robots(&new_domain).await {
+                Ok(words) => {
+                    if let Err(e) = add_words_to_wordlists(&words).await {
+                        eprintln!("⚠️ Falha ao adicionar palavras: {}", e);
+                    }
+                }
+                Err(e) => eprintln!("⚠️ Falha ao extrair robots.txt: {}", e),
+            }
+            
+            let needs_processing = {
+                let conn = conn.lock().await;
+                let mut stmt = match conn.prepare("SELECT processed FROM domains WHERE name = ?1") {
+                    Ok(stmt) => stmt,
+                    Err(e) => {
+                        eprintln!("❌ Erro ao preparar consulta: {}", e);
+                        return;
+                    }
+                };
+                
+                match stmt.query_row(params![&new_domain], |row| row.get::<_, bool>(0)) {
+                    Ok(processed) => !processed,
+                    Err(_) => true // Não encontrado, precisa processar
+                }
+            };
+
+            if !needs_processing {
+                println!("ℹ️ Subdomínio {} já processado. Pulando.", new_domain);
+                return;
+            }
+
+            let active_urls = match run_httpx(&new_domain).await {
+                Ok(urls) => urls,
+                Err(e) => {
+                    eprintln!("❌ Erro no httpx: {}", e);
+                    vec![]
+                }
+            };
+
+            let urls_to_scan = if active_urls.is_empty() {
+                println!("⚠️ Nenhuma URL ativa encontrada, tentando fallback para: {}", new_domain);
+                vec![new_domain.to_string()]
+            } else {
+                active_urls
+            };
+
+            let mut ferox_discovered_urls = Vec::new();
+            let mut ferox_found_something = false;
+
+            for url in &urls_to_scan {
+                match run_feroxbuster(url, threads, &output_dir, &new_domain).await {
+                    Ok(urls) => {
+                        if !urls.is_empty() {
+                            ferox_found_something = true;
+                            let message = format!(
+                                "🚀 *URLs descobertas* em {}\n\n{}",
+                                url,
+                                urls.iter().take(10).map(|u| format!("• {}", u)).collect::<Vec<_>>().join("\n")
+                            );
+                            if urls.len() > 10 {
+                                alert_telegram("Descoberta de URLs", &format!("{} e mais {} URLs", message, urls.len()-10)).await.ok();
+                            } else {
+                                alert_telegram("Descoberta de URLs", &message).await.ok();
+                            }
+                            ferox_discovered_urls.extend(urls);
+                        }
+                    }
+                    Err(e) => eprintln!("❌ Feroxbuster falhou em {}: {}", url, e),
+                }
+            }
+
+            // Se o Feroxbuster não encontrou nada, rodar o Nuclei diretamente
+            if !ferox_found_something {
+                println!("ℹ️ Feroxbuster não encontrou URLs, rodando Nuclei diretamente...");
+                if let Err(e) = run_nuclei(&urls_to_scan, &new_domain, &conn, &output_dir).await {
+                    eprintln!("❌ Nuclei falhou em {}: {}", new_domain, e);
+                }
+            } else {
+                if let Err(e) = run_nuclei(&ferox_discovered_urls, &new_domain, &conn, &output_dir).await {
+                    eprintln!("❌ Nuclei falhou em {}: {}", new_domain, e);
+                }
+            }
+
+            let conn = conn.lock().await;
+            if let Err(e) = conn.execute(
+                "UPDATE domains SET processed = 1 WHERE name = ?1",
+                params![&new_domain],
+            ) {
+                eprintln!("❌ Erro ao atualizar banco: {}", e);
+            } else {
+                println!("✅ Subdomínio marcado como processado: {}", new_domain);
+            }
+        }));
+    }
+
+    // Aguarda todas as tasks terminarem antes de retornar
+    while let Some(result) = tasks.next().await {
+        if let Err(e) = result {
+            eprintln!("❌ Erro na task de escaneamento: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_httpx(domain: &str) -> anyhow::Result<Vec<String>> {
+    println!("🌐 Verificando URLs ativas para: {}", domain);
     
-    // Timeout atingido
-    println!("{} Feroxbuster timed out after 1 minute", "⌛".yellow());
-    cmd.kill()?;
-    cmd.wait()?; // Limpa o processo
-    println!("[*] Proceeding to Nuclei scan immediately");
+    let output = Command::new("httpx")
+        .args(&[
+            "-target", domain,
+            "-ports", TOP_1000_PORTS,
+            "-silent",
+            "-status-code",
+            "-content-length",
+            "-title"
+        ])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("httpx falhou: {}", stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    if stdout.is_empty() {
+        println!("ℹ️ Nenhuma URL ativa encontrada para: {}", domain);
+        return Ok(Vec::new());
+    }
+
+    let active_urls: Vec<String> = stdout.lines()
+        .map(|line| line.split_whitespace().next().unwrap_or("").to_string())
+        .filter(|url| !url.is_empty())
+        .collect();
+
+    println!("✅ {} URLs ativas encontradas", active_urls.len());
+    Ok(active_urls)
+}
+
+async fn run_feroxbuster(url: &str, threads: usize, output_dir: &str, domain: &str) -> anyhow::Result<Vec<String>> {
+    println!("⚡ Executando Feroxbuster em: {}", url);
+    
+    let wordlist = if url.contains("api") || url.contains("dev") || 
+                   url.contains("prod") || url.contains("prd") 
+    {
+        "api_wordlist.txt"
+    } else {
+        "general_wordlist.txt"
+    };
+    
+    if !Path::new(wordlist).exists() {
+        return Err(anyhow!("Wordlist não encontrada: {}", wordlist));
+    }
+    let metadata = fs::metadata(wordlist)?;
+    if metadata.len() == 0 {
+        return Err(anyhow!("Wordlist vazia: {}", wordlist));
+    }
+    
+    // Usar diretório único para todos os resultados
+    fs::create_dir_all(output_dir)?;
+    
+    // Nome do arquivo de saída inclui o domínio para evitar conflitos
+    let output_file = format!("{}/feroxresults_{}.json", output_dir, sanitize_filename(domain));
+    
+    // Sistema de retentativas com timeout
+    let mut attempts = 0;
+    let max_attempts = 3;
+    
+    while attempts < max_attempts {
+        attempts += 1;
+        println!("🔁 Tentativa {}/{} para Feroxbuster", attempts, max_attempts);
+        
+        let result = tokio::time::timeout(
+            Duration::from_secs(120),
+            Command::new("feroxbuster")
+                .args(&[
+                    "--url", url,
+                    "--wordlist", wordlist,
+                    "--threads", &threads.to_string(),
+                    "--collect-backups",
+                    "--collect-extensions",
+                    "--collect-words",
+                    "--force-recursion",
+                    "--no-state",
+                    "--timeout", "20",
+                    "--depth", "3",
+                    "--random-agent",
+                    "--insecure",
+                    "--silent",
+                    "--status-codes", "200",
+                    "--dont-collect", "jpg,jpeg,png,gif,ico,bmp,svg,webp,tiff,woff,woff2,ttf,eot",
+                    "--output", &output_file,
+                ])
+                .status()
+        ).await;
+        
+        match result {
+            Ok(Ok(status)) if status.success() => break,
+            _ => {
+                if attempts < max_attempts {
+                    println!("⏱️ Aguardando 10 segundos antes de tentar novamente...");
+                    sleep(Duration::from_secs(10)).await;
+                }
+            }
+        }
+    }
+
+    // Se o arquivo estiver vazio, retorna lista vazia
+    if let Ok(metadata) = fs::metadata(&output_file) {
+        if metadata.len() == 0 {
+            println!("ℹ️ Feroxbuster não encontrou resultados");
+            return Ok(Vec::new());
+        }
+    } else {
+        println!("⚠️ Feroxbuster não gerou arquivo de saída");
+        return Ok(Vec::new());
+    }
+
+    // Lê o arquivo de saída e extrai URLs
+    let content = match fs::read_to_string(&output_file) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("⚠️ Falha ao ler arquivo de saída: {}", e);
+            return Ok(Vec::new());
+        }
+    };
+
+    let urls: Vec<String> = content.lines()
+        .filter_map(|line| {
+            if line.contains("\"url\":") {
+                line.split(':')
+                    .skip(1)
+                    .collect::<Vec<_>>()
+                    .join(":")
+                    .trim_matches(|c| c == '"' || c == ',' || c == ' ')
+                    .to_string()
+                    .into()
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    println!("✅ Feroxbuster encontrou {} URLs", urls.len());
+    Ok(urls)
+}
+
+fn sanitize_filename(input: &str) -> String {
+    input.replace(|c: char| !c.is_alphanumeric(), "_")
+}
+
+async fn run_nuclei(
+    urls: &[String],
+    domain: &str,
+    conn: &Arc<Mutex<Connection>>,
+    output_dir: &str,
+) -> anyhow::Result<()> {
+    println!("🔬 Executando Nuclei em: {}", domain);
+    
+    if urls.is_empty() {
+        println!("ℹ️ Nenhuma URL para escanear");
+        return Ok(());
+    }
+    
+    // Usar diretório único para todos os resultados
+    fs::create_dir_all(output_dir)?;
+    
+    // Arquivo temporário de entrada
+    let temp_file = format!("{}/nuclei_input_{}.txt", output_dir, sanitize_filename(domain));
+    fs::write(&temp_file, urls.join("\n"))?;
+    
+    // Arquivo de resultados inclui o domínio para evitar conflitos
+    let output_file = format!("{}/nuclei_{}.txt", output_dir, sanitize_filename(domain));
+    
+    // Executa o Nuclei e salva em modo append
+    let output = Command::new("nuclei")
+        .args(&[
+            "-list", &temp_file,
+            "-severity", DEFAULT_SEVERITY,
+            "-tags", "xss,rce,ssrf,misconfig",
+            "-etags", "info",
+            "-follow-redirects",
+            "-concurrency", "20",
+            "-no-color",
+        ])
+        .output()
+        .await?;
+
+    // Remove arquivo temporário
+    fs::remove_file(&temp_file)?;
+
+    // Processa a saída do Nuclei
+    let body = String::from_utf8_lossy(&output.stdout).to_string();
+    
+    if body.is_empty() {
+        println!("ℹ️ Nuclei não encontrou vulnerabilidades");
+        return Ok(());
+    }
+
+    println!("⚠️ Vulnerabilidades encontradas!\n{}", body);
+    
+    // Salva em arquivo com nome único
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&output_file)
+        .await?;
+    
+    file.write_all(body.as_bytes()).await?;
+    file.write_all(b"\n").await?;
+
+    // Salva no banco de dados
+    let conn = conn.lock().await;
+    conn.execute(
+        "INSERT OR REPLACE INTO scan_results (domain, nuclei_data, scanned_at) VALUES (?1, ?2, ?3)",
+        params![domain, body, Local::now().to_rfc3339()],
+    )?;
+    
+    // Formatar saída do Nuclei para Telegram
+    let message = format!(
+        "🚨 *VULNERABILIDADES ENCONTRADAS* em {}\n\n{}\n",
+        domain, body
+    );
+    alert_telegram("Vulnerabilidades Detectadas", &message).await?;
     
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
-    validate_dependencies();
-    let args = Args::parse();
-    let domain = &args.domain;
-    fs::create_dir_all(domain)?;
-    let base = Path::new(domain);
-
-    brute_force_vhosts(domain, base)?;
-
-    let subs_txt = base.join("subdomains.txt");
-    println!("[*] Enumerating subdomains via subfinder...");
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "subfinder -silent -all -d {} | anew {}",
-            domain,
-            subs_txt.display()
-        ))
-        .status()?;
-
-    println!("[*] Extracting certificate SANs with tlsx...");
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "echo {} | tlsx -json -silent | jq -r '.subject_an[] | ltrimstr(\"*.\")' | anew {}",
-            domain,
-            subs_txt.display()
-        ))
-        .status()?;
-
-    let ips_txt = base.join("ips.txt");
-    println!("[*] Resolving subdomains to IPs with dnsx...");
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "cat {} | dnsx -a -resp-only -silent -o {}",
-            subs_txt.display(),
-            ips_txt.display()
-        ))
-        .status()?;
-
-    let masscan_txt = base.join("masscan.txt");
-    println!("[*] Scanning ports with masscan...");
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "masscan -iL {} --ports 1-65535 --rate 10000 -oL {}",
-            ips_txt.display(),
-            masscan_txt.display()
-        ))
-        .status()?;
-
-    let ports_txt = base.join("ports.txt");
-    println!("[*] Validating open ports with httpx...");
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "cat {} | awk '/open/ {{print $4 \":\" $3}}' | httpx -silent -o {}",
-            masscan_txt.display(),
-            ports_txt.display()
-        ))
-        .status()?;
-
-    let http200_txt = base.join("http200.txt");
-    println!("[*] Resolving hosts with httpx...");
-    Command::new("httpx")
-        .args(&[
-            "-silent",
-            "-follow-redirects",
-            "-max-redirects",
-            "10",
-            "-list",
-            &subs_txt.to_string_lossy(),
-            "-o",
-            &http200_txt.to_string_lossy(),
-        ])
-        .status()?;
-
-    let mut cloud_buckets_file = File::create(base.join("cloud_buckets.txt"))?;
-    let mut urls_file = File::create(base.join("urls.txt"))?;
-    let mut hidden_file = File::create(base.join("hiddenparams.txt"))?;
-
-    // Cloud bucket regex patterns
-    let cloud_regexes = vec![
-        Regex::new(r"(?:^|[^a-z0-9])([a-z0-9\-\.]+\.s3\.amazonaws\.com)").unwrap(),
-        Regex::new(r"(?:^|[^a-z0-9])(s3-[a-z0-9\-]+\.amazonaws\.com/[a-z0-9\-]+)").unwrap(),
-        Regex::new(r"(?:^|[^a-z0-9])(s3\.[a-z0-9\-]+\.amazonaws\.com/[a-z0-9\-]+)").unwrap(),
-        Regex::new(r"(?:^|[^a-z0-9])([a-z0-9\-]+\.s3-website[\.\-](?:eu|ap|us|sa|ca|af|me|cn)[\-][a-z0-9\-]+\.amazonaws\.com(?:[/\.].*)?)").unwrap(),
-        Regex::new(r"(?:^|[^a-z0-9])([a-z0-9\-\.]+\.s3\.(?:[a-z0-9\-]+\.)?amazonaws\.com\.?[^a-z0-9\.])").unwrap(),
-        Regex::new(r"(?:^|[^a-z0-9])(storage\.cloud\.google\.com/[a-z0-9\-_\.]+)").unwrap(),
-        Regex::new(r"(?:^|[^a-z0-9])([a-z0-9\-\.]+\.storage\.googleapis\.com)").unwrap(),
-        Regex::new(r"(?:^|[^a-z0-9])([a-z0-9\-_\.]+\.appspot\.com)").unwrap(),
-        Regex::new(r"(?:^|[^a-z0-9])([a-z0-9\-]+\.blob\.core\.windows\.net)").unwrap(),
-        Regex::new(r"(?:^|[^a-z0-9])([a-z0-9\-]+\.azurewebsites\.net)").unwrap(),
-        Regex::new(r"(?:^|[^a-z0-9])([a-z0-9\-]+\.azure-api\.net)").unwrap(),
-        Regex::new(r"(?:^|[^a-z0-9])([a-z0-9\-]+\.file\.core\.windows\.net)").unwrap(),
-    ];
-
-    let re_comment_urls = Regex::new(r#"https?://[^\"\s]+"#)?;
-    let re_comments = Regex::new(r#"<!--([\s\S]*?)-->"#)?;
-    let re_hidden = Regex::new(r#"<input[^>]+name=('?\"?)([^\"'>\s]+)(\"?'?)"#)?;
-
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .danger_accept_invalid_certs(true)
-        .build()?;
-
-    let mut seen_buckets = HashSet::new();
-    let mut seen_urls = HashSet::new();
-    let mut seen_hidden = HashSet::new();
-
-    let file = File::open(&http200_txt)?;
-    for line in BufReader::new(file).lines() {
-        let url = line?;
-        println!("[+] Crawling: {}", url);
-        if let Ok(resp) = client.get(&url).send() {
-            if let Ok(body) = resp.text() {
-                let document = Html::parse_document(&body);
-                
-                for regex in &cloud_regexes {
-                    for cap in regex.captures_iter(&body) {
-                        if let Some(bucket) = cap.get(1) {
-                            let bucket_str = bucket.as_str().trim_matches(|c| c == '\'' || c == '"' || c == '\\');
-                            if seen_buckets.insert(bucket_str.to_string()) {
-                                writeln!(cloud_buckets_file, "{}", bucket_str)?;
-                                println!("{} Found cloud bucket: {}", "✔".green(), bucket_str.green());
-                            }
-                        }
-                    }
-                }
-                
-                let sel = Selector::parse("a[href]").unwrap();
-                for elem in document.select(&sel) {
-                    if let Some(href) = elem.value().attr("href") {
-                        if href.contains(domain) && seen_urls.insert(href.to_string()) {
-                            writeln!(urls_file, "{}", href)?;
-                        }
-                    }
-                }
-                
-                for caps in re_comments.captures_iter(&body) {
-                    let comment_text = &caps[1];
-                    for url_cap in re_comment_urls.find_iter(comment_text) {
-                        let link = url_cap.as_str().trim_end_matches('"').to_string();
-                        if link.contains(domain) && seen_urls.insert(link.clone()) {
-                            writeln!(urls_file, "{}", link)?;
-                        }
-                    }
-                }
-                
-                if let Some(hurls) = extract_hidden_params(&url, &body, &re_hidden) {
-                    for hurl in hurls {
-                        if seen_hidden.insert(hurl.clone()) {
-                            writeln!(hidden_file, "{}", hurl)?;
-                        }
+async fn alert_telegram(title: &str, message: &str) -> anyhow::Result<()> {
+    let token = "7855940469:AAH1JBuBEr1y__bt7LjLf1NGFvP7TU7XKyY";
+    let chat_id = "215999042";
+    
+    // Limitar o tamanho da mensagem
+    let max_length = 4000;
+    let truncated_msg = if message.len() > max_length {
+        &message[..max_length]
+    } else {
+        message
+    };
+    
+    let text = format!("🛡️ *{}*\n\n{}", title, truncated_msg);
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    
+    let max_retries = 3;
+    let mut retry_count = 0;
+    
+    loop {
+        let response = reqwest::Client::new()
+            .post(&url)
+            .form(&[
+                ("chat_id", chat_id),
+                ("text", &text),
+                ("parse_mode", "Markdown"),
+                ("disable_web_page_preview", "true")
+            ])
+            .send()
+            .await?;
+    
+        let status = response.status().as_u16();
+        let body = response.text().await?;
+        
+        if status == 200 {
+            return Ok(());
+        }
+        
+        if status == 429 {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(retry_after) = json["parameters"]["retry_after"].as_u64() {
+                    if retry_count < max_retries {
+                        retry_count += 1;
+                        eprintln!("⚠️ Limite do Telegram excedido. Tentando novamente em {} segundos", retry_after);
+                        sleep(Duration::from_secs(retry_after)).await;
+                        continue;
                     }
                 }
             }
         }
+        
+        return Err(anyhow!("Falha no Telegram ({}) {}", status, body));
+    }
+}
+
+async fn enum_subdomains(domain: &str) -> anyhow::Result<HashSet<String>> {
+    println!("🌐 Enumerando subdomínios para: {}", domain);
+    let output = Command::new("subfinder")
+        .args(&["-d", domain, "-all", "-silent"])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("Subfinder falhou: {}", stderr));
     }
 
-    println!("[*] Extracting params with hakrawler...");
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "cat {} | hakrawler -s href -subs | anew {}",
-            http200_txt.display(),
-            base.join("params.txt").display()
-        ))
-        .status()?;
-
-    let wordlist_url = "https://raw.githubusercontent.com/onvio/wordlists/master/words_and_files_top5000.txt";
-    let wordlist_path = base.join("wordlist.txt");
-
-    if !wordlist_path.exists() {
-        println!("[*] Downloading wordlist...");
-        Command::new("sh")
-            .arg("-c")
-            .arg(format!("curl -s -o {} {}", wordlist_path.display(), wordlist_url))
-            .status()?;
-    }
-
-    // Crawler de robots.txt para cada subdomínio
-    println!("[*] Crawling robots.txt for all domains...");
-    let subs_file = File::open(&subs_txt)?;
-    let mut domains_processed = HashSet::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let set: HashSet<String> = stdout.lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     
-    for line in BufReader::new(subs_file).lines() {
-        let domain = line?;
-        if domains_processed.insert(domain.clone()) {
-            println!("🔍 Checking robots.txt for: {}", domain);
-            match fetch_robots_paths(&domain) {
-                Ok(paths) => {
-                    if !paths.is_empty() {
-                        println!("   🎯 Found {} paths in robots.txt", paths.len());
-                        if let Err(e) = add_words_to_wordlists(&paths, &wordlist_path) {
-                            eprintln!("⚠️ Failed to add words to wordlist: {}", e);
-                        }
-                    }
-                }
-                Err(e) => eprintln!("⚠️ Failed to fetch robots.txt: {}", e),
-            }
+    if set.is_empty() {
+        println!("ℹ️ Nenhum subdomínio encontrado");
+    } else {
+        println!("✅ {} subdomínios encontrados", set.len());
+    }
+    
+    Ok(set)
+}
+
+fn get_known(conn: &Connection) -> rusqlite::Result<HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT name FROM domains")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut set = HashSet::new();
+    for res in rows { 
+        if let Ok(name) = res {
+            set.insert(name); 
         }
     }
+    Ok(set)
+}
 
-    // Feroxbuster on subdomains and ports
-    let ferox_output = base.join("ferox_results.json");
-    
-    // Combine subdomains and ports into one file for feroxbuster
-    let combined_targets = base.join("combined_targets.txt");
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "cat {} {} | sort -u > {}",
-            subs_txt.display(),
-            ports_txt.display(),
-            combined_targets.display()
-        ))
-        .status()?;
-    
-    // Execute Feroxbuster with timeout handling
-    run_feroxbuster_with_timeout(&combined_targets, &wordlist_path, &ferox_output)?;
-
-    // Parse Feroxbuster results (mesmo se timeout ocorrer)
-    parse_feroxbuster_results(&ferox_output, base)?;
-
-    // Run Nuclei scan on all discovered URLs
-    run_nuclei_scan(&http200_txt, base)?;
-
-    println!(
-        "[*] Done. Results saved in \"{}\" directory. Files: subdomains.txt, masscan.txt, ports.txt, http200.txt, cloud_buckets.txt, urls.txt, hiddenparams.txt, params.txt, ferox_results.json, ferox_parsed.txt, nuclei_results.txt, vhost_results.txt",
-        domain
-    );
-    
-    Ok(())
+fn init_db() -> rusqlite::Result<Connection> {
+    let first = !Path::new(DB_FILE).exists();
+    let conn = Connection::open(DB_FILE)?;
+    if first {
+        conn.execute(
+            "CREATE TABLE domains (name TEXT PRIMARY KEY, seen_at TEXT, processed BOOLEAN DEFAULT 0)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE scan_results (
+                domain TEXT PRIMARY KEY,
+                nuclei_data TEXT,
+                scanned_at TEXT
+            )",
+            [],
+        )?;
+        println!("✅ Banco de dados inicializado");
+    } else {
+        let _ = conn.execute(
+            "ALTER TABLE domains ADD COLUMN processed BOOLEAN DEFAULT 0",
+            [],
+        );
+    }
+    Ok(conn)
 }
