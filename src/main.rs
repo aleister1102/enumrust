@@ -17,7 +17,11 @@ use colored::*;
 struct Args {
     /// Target domain to enumerate
     #[arg(short, long)]
-    domain: String,
+    domain: Option<String>,
+    
+    /// File containing list of domains to enumerate
+    #[arg(short, long)]
+    list: Option<String>,
 }
 
 fn validate_dependencies() {
@@ -328,10 +332,7 @@ fn run_feroxbuster_with_timeout(
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
-    validate_dependencies();
-    let args = Args::parse();
-    let domain = &args.domain;
+fn process_domain(domain: &str) -> anyhow::Result<()> {
     fs::create_dir_all(domain)?;
     let base = Path::new(domain);
 
@@ -549,13 +550,9 @@ fn main() -> anyhow::Result<()> {
 
     parse_feroxbuster_results(&ferox_output, base)?;
 
-    // ========================================================================
-    // CONSOLIDAÇÃO DE URLs PARA NUCLEI (CORRIGIDA)
-    // ========================================================================
     let final_urls = base.join("final_urls.txt");
     println!("\n{} Consolidating all discovered URLs for Nuclei", "📦".cyan());
     
-    // Comando corrigido: incluído hiddenparams.txt
     Command::new("sh")
         .arg("-c")
         .arg(format!(
@@ -564,12 +561,11 @@ fn main() -> anyhow::Result<()> {
             base.join("urls.txt").display(),
             base.join("params.txt").display(),
             base.join("ferox_parsed.txt").display(),
-            base.join("hiddenparams.txt").display(), // ADIÇÃO CRÍTICA
+            base.join("hiddenparams.txt").display(),
             final_urls.display()
         ))
         .status()?;
 
-    // Contagem de URLs descobertas
     if let Ok(count) = Command::new("sh")
         .arg("-c")
         .arg(format!("wc -l < {}", final_urls.display()))
@@ -579,9 +575,6 @@ fn main() -> anyhow::Result<()> {
         println!("{} Total URLs discovered: {}", "•".green(), count_str);
     }
 
-    // ========================================================================
-    // EXECUÇÃO DO NUCLEI COM TODAS AS URLs
-    // ========================================================================
     run_nuclei_scan(&final_urls, base)?;
 
     println!(
@@ -591,6 +584,32 @@ fn main() -> anyhow::Result<()> {
     );
     println!("{} Final URLs: {}", "•".cyan(), final_urls.display());
     println!("{} Nuclei results: {}/nuclei_results.txt", "•".cyan(), domain);
+    
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    validate_dependencies();
+    let args = Args::parse();
+    
+    if args.domain.is_none() && args.list.is_none() {
+        eprintln!("Error: Either --domain or --list must be specified");
+        std::process::exit(1);
+    }
+
+    if let Some(domain) = args.domain {
+        process_domain(&domain)?;
+    } else if let Some(list_path) = args.list {
+        let file = File::open(&list_path)?;
+        for line in BufReader::new(file).lines() {
+            let domain = line?;
+            println!("\n{} Processing domain: {}", "🚀".cyan(), domain);
+            if let Err(e) = process_domain(&domain) {
+                eprintln!("⚠️ Failed to process domain {}: {}", domain, e);
+                continue;
+            }
+        }
+    }
     
     Ok(())
 }
