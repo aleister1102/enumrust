@@ -10,6 +10,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use colored::*;
+use anyhow::{Context, Result};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use log::{info, warn};
+use tokio;
+use futures::future::join_all;
 
 /// Subdomain enumerator and simple crawler with port scanning
 #[derive(Parser)]
@@ -47,7 +52,7 @@ fn validate_dependencies() {
     println!("");
 }
 
-fn brute_force_vhosts(domain: &str, base: &Path) -> anyhow::Result<()> {
+fn brute_force_vhosts(domain: &str, base: &Path) -> Result<()> {
     let vhost_output = base.join("vhost_results.txt");
     
     if vhost_output.exists() {
@@ -109,7 +114,7 @@ fn brute_force_vhosts(domain: &str, base: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_feroxbuster_results(ferox_output: &Path, base: &Path) -> anyhow::Result<()> {
+fn parse_feroxbuster_results(ferox_output: &Path, base: &Path) -> Result<()> {
     let parsed_output = base.join("ferox_parsed.txt");
     let mut output_file = File::create(&parsed_output)?;
     
@@ -158,7 +163,7 @@ fn parse_feroxbuster_results(ferox_output: &Path, base: &Path) -> anyhow::Result
     Ok(())
 }
 
-fn run_nuclei_scan(input_file: &Path, base: &Path) -> anyhow::Result<()> {
+fn run_nuclei_scan(input_file: &Path, base: &Path) -> Result<()> {
     let nuclei_output = base.join("nuclei_results.txt");
     
     println!("\n{} Running Nuclei scan on consolidated URLs", "⚡".yellow());
@@ -195,7 +200,7 @@ fn extract_hidden_params(
     let mut params = Vec::new();
     for cap in re_hidden.captures_iter(html) {
         let name = cap[2].to_string();
-        // Ignorar parâmetros comuns de frameworks que não são interessantes
+        // Skip common framework parameters that aren't interesting
         if name.contains("__") || name == "csrf" || name == "token" || name == "session" {
             continue;
         }
@@ -209,7 +214,7 @@ fn extract_hidden_params(
     Some(vec![full])
 }
 
-fn fetch_robots_paths(domain: &str) -> anyhow::Result<Vec<String>> {
+fn fetch_robots_paths(domain: &str) -> Result<Vec<String>> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .danger_accept_invalid_certs(true)
@@ -247,7 +252,7 @@ fn fetch_robots_paths(domain: &str) -> anyhow::Result<Vec<String>> {
     Ok(Vec::new())
 }
 
-fn add_words_to_wordlists(paths: &[String], wordlist_path: &Path) -> anyhow::Result<()> {
+fn add_words_to_wordlists(paths: &[String], wordlist_path: &Path) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -276,7 +281,7 @@ fn run_feroxbuster_with_timeout(
     combined_targets: &Path,
     wordlist_path: &Path,
     ferox_output: &Path,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     println!("[*] Running feroxbuster with 1-minute timeout...");
     
     let start_time = Instant::now();
@@ -332,69 +337,109 @@ fn run_feroxbuster_with_timeout(
     Ok(())
 }
 
-fn process_domain(domain: &str) -> anyhow::Result<()> {
-    fs::create_dir_all(domain)?;
+async fn process_domain(domain: &str) -> Result<()> {
+    info!("Starting enumeration for domain: {}", domain);
+
+    // Create progress bars
+    let multi = MultiProgress::new();
+    let progress_style = ProgressStyle::default_bar()
+        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
+        .unwrap();
+
+    let pb = multi.add(ProgressBar::new_spinner());
+    pb.set_style(progress_style.clone());
+    pb.set_message("Initializing...");
+    fs::create_dir_all(domain).context("Failed to create directory")?;
     let base = Path::new(domain);
 
-    brute_force_vhosts(domain, base)?;
+    pb.set_message("Brute forcing vhosts...");
+    if let Err(e) = brute_force_vhosts(domain, base) {
+        warn!("Vhost enumeration failed: {}", e);
+    }
 
     let subs_txt = base.join("subdomains.txt");
-    println!("[*] Enumerating subdomains via subfinder...");
-    Command::new("sh")
+    pb.set_message("Enumerating subdomains via subfinder...");
+    
+    let subfinder_output = Command::new("sh")
         .arg("-c")
         .arg(format!(
             "subfinder -silent -all -d {} | anew {}",
             domain,
             subs_txt.display()
         ))
-        .status()?;
+        .output()
+        .context("Failed to run subfinder")?;
 
-    println!("[*] Extracting certificate SANs with tlsx...");
-    Command::new("sh")
+    if !subfinder_output.status.success() {
+        warn!("Subfinder failed: {}", String::from_utf8_lossy(&subfinder_output.stderr));
+    }
+
+    pb.set_message("Extracting certificate SANs with tlsx...");
+    let tlsx_output = Command::new("sh")
         .arg("-c")
         .arg(format!(
             "echo {} | tlsx -json -silent | jq -r '.subject_an[] | ltrimstr(\"*.\")' | anew {}",
             domain,
             subs_txt.display()
         ))
-        .status()?;
+        .output()
+        .context("Failed to run tlsx")?;
+
+    if !tlsx_output.status.success() {
+        warn!("TLSX failed: {}", String::from_utf8_lossy(&tlsx_output.stderr));
+    }
 
     let ips_txt = base.join("ips.txt");
-    println!("[*] Resolving subdomains to IPs with dnsx...");
-    Command::new("sh")
+    pb.set_message("Resolving subdomains to IPs with dnsx...");
+    let dnsx_output = Command::new("sh")
         .arg("-c")
         .arg(format!(
             "cat {} | dnsx -a -resp-only -silent -o {}",
             subs_txt.display(),
             ips_txt.display()
         ))
-        .status()?;
+        .output()
+        .context("Failed to run dnsx")?;
+
+    if !dnsx_output.status.success() {
+        warn!("DNSX failed: {}", String::from_utf8_lossy(&dnsx_output.stderr));
+    }
 
     let masscan_txt = base.join("masscan.txt");
-    println!("[*] Scanning ports with masscan...");
-    Command::new("sh")
+    pb.set_message("Scanning ports with masscan...");
+    let masscan_output = Command::new("sh")
         .arg("-c")
         .arg(format!(
             "masscan -iL {} --ports 1-65535 --rate 10000 -oL {}",
             ips_txt.display(),
             masscan_txt.display()
         ))
-        .status()?;
+        .output()
+        .context("Failed to run masscan")?;
+
+    if !masscan_output.status.success() {
+        warn!("Masscan failed: {}", String::from_utf8_lossy(&masscan_output.stderr));
+    }
 
     let ports_txt = base.join("ports.txt");
-    println!("[*] Validating open ports with httpx...");
-    Command::new("sh")
+    pb.set_message("Validating open ports with httpx...");
+    let httpx_ports_output = Command::new("sh")
         .arg("-c")
         .arg(format!(
             "cat {} | awk '/open/ {{print $4 \":\" $3}}' | httpx -silent -o {}",
             masscan_txt.display(),
             ports_txt.display()
         ))
-        .status()?;
+        .output()
+        .context("Failed to run httpx for ports")?;
+
+    if !httpx_ports_output.status.success() {
+        warn!("HTTPX ports scan failed: {}", String::from_utf8_lossy(&httpx_ports_output.stderr));
+    }
 
     let http200_txt = base.join("http200.txt");
-    println!("[*] Resolving hosts with httpx...");
-    Command::new("httpx")
+    pb.set_message("Resolving hosts with httpx...");
+    let httpx_hosts_output = Command::new("httpx")
         .args(&[
             "-silent",
             "-follow-redirects",
@@ -405,7 +450,12 @@ fn process_domain(domain: &str) -> anyhow::Result<()> {
             "-o",
             &http200_txt.to_string_lossy(),
         ])
-        .status()?;
+        .output()
+        .context("Failed to run httpx for hosts")?;
+
+    if !httpx_hosts_output.status.success() {
+        warn!("HTTPX hosts scan failed: {}", String::from_utf8_lossy(&httpx_hosts_output.stderr));
+    }
 
     let mut cloud_buckets_file = File::create(base.join("cloud_buckets.txt"))?;
     let mut urls_file = File::create(base.join("urls.txt"))?;
@@ -415,7 +465,7 @@ fn process_domain(domain: &str) -> anyhow::Result<()> {
         Regex::new(r"(?:^|[^a-z0-9])([a-z0-9\-\.]+\.s3\.amazonaws\.com)").unwrap(),
         Regex::new(r"(?:^|[^a-z0-9])(s3-[a-z0-9\-]+\.amazonaws\.com/[a-z0-9\-]+)").unwrap(),
         Regex::new(r"(?:^|[^a-z0-9])(s3\.[a-z0-9\-]+\.amazonaws\.com/[a-z0-9\-]+)").unwrap(),
-        Regex::new(r"(?:^|[^a-z0-9])([a-z0-9\-]+\.s3-website[\.\-](?:eu|ap|us|sa|ca|af|me|cn)[\-][a-z0-9\-]+\.amazonaws\.com(?:[/\.].*)?)").unwrap(),
+        Regex::new(r"(?:^|[^a-z0-9])([a-z0-9\-]+\.s3-website[\.\.-](?:eu|ap|us|sa|ca|af|me|cn)[\-][a-z0-9\-]+\.amazonaws\.com(?:[/\.].*)?)").unwrap(),
         Regex::new(r"(?:^|[^a-z0-9])([a-z0-9\-\.]+\.s3\.(?:[a-z0-9\-]+\.)?amazonaws\.com\.?[^a-z0-9\.])").unwrap(),
         Regex::new(r"(?:^|[^a-z0-9])(storage\.cloud\.google\.com/[a-z0-9\-_\.]+)").unwrap(),
         Regex::new(r"(?:^|[^a-z0-9])([a-z0-9\-\.]+\.storage\.googleapis\.com)").unwrap(),
@@ -439,177 +489,189 @@ fn process_domain(domain: &str) -> anyhow::Result<()> {
     let mut seen_urls = HashSet::new();
     let mut seen_hidden = HashSet::new();
 
-    let file = File::open(&http200_txt)?;
-    for line in BufReader::new(file).lines() {
-        let url = line?;
-        println!("[+] Crawling: {}", url);
-        if let Ok(resp) = client.get(&url).send() {
-            if let Ok(body) = resp.text() {
+    pb.set_message("Crawling URLs and scanning for cloud resources...");
+    let file = File::open(&http200_txt).context("Failed to open http200.txt")?;
+    let lines: Vec<String> = BufReader::new(file).lines().collect::<Result<_, _>>()?;
+    
+    let progress_bar = ProgressBar::new(lines.len() as u64);
+    progress_bar.set_style(ProgressStyle::default_bar()
+        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
+        .unwrap());
+
+    for url in lines {
+        progress_bar.set_message(format!("Crawling: {}", url));
+        match client.get(&url).send().and_then(|r| r.text()) {
+            Ok(body) => {
                 let document = Html::parse_document(&body);
                 
+                // Scan for cloud buckets
                 for regex in &cloud_regexes {
                     for cap in regex.captures_iter(&body) {
                         if let Some(bucket) = cap.get(1) {
                             let bucket_str = bucket.as_str().trim_matches(|c| c == '\'' || c == '"' || c == '\\');
                             if seen_buckets.insert(bucket_str.to_string()) {
-                                writeln!(cloud_buckets_file, "{}", bucket_str)?;
-                                println!("{} Found cloud bucket: {}", "✔".green(), bucket_str.green());
+                                if let Err(e) = writeln!(cloud_buckets_file, "{}", bucket_str) {
+                                    warn!("Failed to write cloud bucket to file: {}", e);
+                                } else {
+                                    info!("Found cloud bucket: {}", bucket_str);
+                                    progress_bar.println(format!("{} Found cloud bucket: {}", "✔".green(), bucket_str.green()));
+                                }
                             }
                         }
                     }
                 }
                 
-                let sel = Selector::parse("a[href]").unwrap();
-                for elem in document.select(&sel) {
-                    if let Some(href) = elem.value().attr("href") {
-                        if href.contains(domain) && seen_urls.insert(href.to_string()) {
-                            writeln!(urls_file, "{}", href)?;
+                // Extract URLs from href attributes
+                if let Ok(sel) = Selector::parse("a[href]") {
+                    for elem in document.select(&sel) {
+                        if let Some(href) = elem.value().attr("href") {
+                            if href.contains(domain) && seen_urls.insert(href.to_string()) {
+                                if let Err(e) = writeln!(urls_file, "{}", href) {
+                                    warn!("Failed to write URL to file: {}", e);
+                                } else {
+                                    info!("Found URL: {}", href);
+                                }
+                            }
                         }
                     }
+                } else {
+                    warn!("Failed to parse href selector");
                 }
                 
+                // Extract URLs from HTML comments
                 for caps in re_comments.captures_iter(&body) {
                     let comment_text = &caps[1];
                     for url_cap in re_comment_urls.find_iter(comment_text) {
                         let link = url_cap.as_str().trim_end_matches('"').to_string();
                         if link.contains(domain) && seen_urls.insert(link.clone()) {
-                            writeln!(urls_file, "{}", link)?;
+                            if let Err(e) = writeln!(urls_file, "{}", link) {
+                                warn!("Failed to write comment URL to file: {}", e);
+                            } else {
+                                info!("Found comment URL: {}", link);
+                            }
                         }
                     }
                 }
                 
+                // Extract hidden parameters
                 if let Some(hurls) = extract_hidden_params(&url, &body, &re_hidden) {
                     for hurl in hurls {
-                        println!("[+] Hidden param found: {}", hurl.blue());
                         if seen_hidden.insert(hurl.clone()) {
-                            writeln!(hidden_file, "{}", hurl)?;
+                            if let Err(e) = writeln!(hidden_file, "{}", hurl) {
+                                warn!("Failed to write hidden parameter to file: {}", e);
+                            } else {
+                                info!("Found hidden parameter: {}", hurl);
+                                progress_bar.println(format!("[+] Hidden param found: {}", hurl.blue()));
+                            }
                         }
                     }
                 }
             }
+            _ => continue,
         }
     }
 
-    println!("[*] Extracting params with hakrawler...");
-    Command::new("sh")
+    pb.set_message("Extracting parameters with hakrawler...");
+    let hakrawler_output = Command::new("sh")
         .arg("-c")
         .arg(format!(
             "cat {} | hakrawler -s href -subs | anew {}",
             http200_txt.display(),
             base.join("params.txt").display()
         ))
-        .status()?;
+        .output()
+        .context("Failed to run hakrawler")?;
+
+    if !hakrawler_output.status.success() {
+        warn!("Hakrawler failed: {}", String::from_utf8_lossy(&hakrawler_output.stderr));
+    } else {
+        info!("Successfully extracted parameters with hakrawler");
+    }
 
     let wordlist_url = "https://raw.githubusercontent.com/onvio/wordlists/master/words_and_files_top5000.txt";
     let wordlist_path = base.join("wordlist.txt");
 
     if !wordlist_path.exists() {
-        println!("[*] Downloading wordlist...");
-        Command::new("sh")
+        pb.set_message("Downloading wordlist...");
+        let curl_output = Command::new("sh")
             .arg("-c")
             .arg(format!("curl -s -o {} {}", wordlist_path.display(), wordlist_url))
-            .status()?;
+            .output()
+            .context("Failed to download wordlist")?;
+
+        if !curl_output.status.success() {
+            warn!("Failed to download wordlist: {}", String::from_utf8_lossy(&curl_output.stderr));
+        } else {
+            info!("Successfully downloaded wordlist");
+        }
     }
 
-    println!("[*] Crawling robots.txt for all domains...");
-    let subs_file = File::open(&subs_txt)?;
-    let mut domains_processed = HashSet::new();
-    
-    for line in BufReader::new(subs_file).lines() {
-        let domain = line?;
-        if domains_processed.insert(domain.clone()) {
-            println!("🔍 Checking robots.txt for: {}", domain);
-            match fetch_robots_paths(&domain) {
-                Ok(paths) => {
-                    if !paths.is_empty() {
-                        println!("   🎯 Found {} paths in robots.txt", paths.len());
-                        if let Err(e) = add_words_to_wordlists(&paths, &wordlist_path) {
-                            eprintln!("⚠️ Failed to add words to wordlist: {}", e);
-                        }
-                    }
-                }
-                Err(e) => eprintln!("⚠️ Failed to fetch robots.txt: {}", e),
+    pb.set_message("Crawling robots.txt paths...");
+    let paths = fetch_robots_paths(domain)?;
+    if !paths.is_empty() {
+        add_words_to_wordlists(&paths, &wordlist_path)?;
+    }
+
+    let combined_targets = base.join("combined_targets.txt");
+    let mut combined_file = File::create(&combined_targets)?;
+
+    // Combine targets from http200.txt, ports.txt, and params.txt
+    for source in &[&http200_txt, &ports_txt, &base.join("params.txt")] {
+        if source.exists() {
+            if let Ok(content) = fs::read_to_string(source) {
+                write!(combined_file, "{}", content)?;
             }
         }
     }
 
-    let ferox_output = base.join("ferox_results.json");
-    
-    let combined_targets = base.join("combined_targets.txt");
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "cat {} {} | sort -u > {}",
-            subs_txt.display(),
-            ports_txt.display(),
-            combined_targets.display()
-        ))
-        .status()?;
-    
+    let ferox_output = base.join("ferox_output.txt");
     run_feroxbuster_with_timeout(&combined_targets, &wordlist_path, &ferox_output)?;
-
     parse_feroxbuster_results(&ferox_output, base)?;
 
+    // Consolidate final URLs for nuclei scan
     let final_urls = base.join("final_urls.txt");
-    println!("\n{} Consolidating all discovered URLs for Nuclei", "📦".cyan());
-    
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "cat {} {} {} {} {} | grep -E '^https?://' | awk '!seen[$0]++' | grep -v -E '\\.(png|jpg|jpeg|gif|ico|css|js|svg|woff|ttf|eot)(\\?.*)?$' | sort -u > {}",
-            http200_txt.display(),
-            base.join("urls.txt").display(),
-            base.join("params.txt").display(),
-            base.join("ferox_parsed.txt").display(),
-            base.join("hiddenparams.txt").display(),
-            final_urls.display()
-        ))
-        .status()?;
+    let mut final_file = File::create(&final_urls)?;
 
-    if let Ok(count) = Command::new("sh")
-        .arg("-c")
-        .arg(format!("wc -l < {}", final_urls.display()))
-        .output()
-    {
-        let count_str = String::from_utf8_lossy(&count.stdout).trim().to_string();
-        println!("{} Total URLs discovered: {}", "•".green(), count_str);
+    for source in &[&http200_txt, &ports_txt, &base.join("params.txt"), &base.join("ferox_parsed.txt"), &base.join("hiddenparams.txt")] {
+        if source.exists() {
+            if let Ok(content) = fs::read_to_string(source) {
+                write!(final_file, "{}", content)?;
+            }
+        }
     }
 
     run_nuclei_scan(&final_urls, base)?;
-
-    println!(
-        "\n{} Scan completed! Results saved in: {}/",
-        "✅".green(),
-        domain
-    );
-    println!("{} Final URLs: {}", "•".cyan(), final_urls.display());
-    println!("{} Nuclei results: {}/nuclei_results.txt", "•".cyan(), domain);
-    
+    pb.finish_with_message("Domain processing complete");
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
-    validate_dependencies();
+#[tokio::main]
+async fn main() -> Result<()> {
+    env_logger::init();
     let args = Args::parse();
-    
-    if args.domain.is_none() && args.list.is_none() {
-        eprintln!("Error: Either --domain or --list must be specified");
-        std::process::exit(1);
-    }
+    validate_dependencies();
 
-    if let Some(domain) = args.domain {
-        process_domain(&domain)?;
-    } else if let Some(list_path) = args.list {
-        let file = File::open(&list_path)?;
-        for line in BufReader::new(file).lines() {
-            let domain = line?;
-            println!("\n{} Processing domain: {}", "🚀".cyan(), domain);
-            if let Err(e) = process_domain(&domain) {
-                eprintln!("⚠️ Failed to process domain {}: {}", domain, e);
-                continue;
-            }
+    match (args.domain, args.list) {
+        (Some(domain), None) => {
+            process_domain(&domain).await?
+        },
+        (None, Some(list_path)) => {
+            let domains: Vec<String> = fs::read_to_string(list_path)?
+                .lines()
+                .map(String::from)
+                .collect();
+            
+            let tasks: Vec<_> = domains.iter()
+                .map(|domain| process_domain(domain))
+                .collect();
+            
+            join_all(tasks).await;
+        },
+        _ => {
+            eprintln!("Please provide either a domain (-d) or a list of domains (-l)");
+            std::process::exit(1);
         }
     }
-    
+
     Ok(())
 }
