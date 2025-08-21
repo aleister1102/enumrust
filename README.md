@@ -60,8 +60,10 @@ cargo run --release -- -d example.com
 ## 📦 Installation
 
 ```bash
-git clone https://github.com/youruser/enumRust.git
-cd enumRust
+apt install rustup pkg-config libssl-dev
+rustup default stable
+git clone https://github.com/KingOfBugbounty/enumrust.git
+cd enumrust
 cargo build --release
 ```
 
